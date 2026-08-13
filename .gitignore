@@ -1,0 +1,4 @@
+node_modules/
+.mkvbase_profile/
+*.log
+.env
