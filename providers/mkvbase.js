@@ -277,9 +277,11 @@ let mkvbaseBrowserBusy = false;
 const BASE_URL = "https://mkvbase.site";
 const SESSION_PATH = path.join(__dirname, "../.mkvbase_profile/session.json");
 const DIRECT_SESSION_TTL_MS = Number(process.env.MKVBASE_DIRECT_SESSION_TTL_MS || 10 * 60 * 60 * 1000);
-const MKVBASE_MAX_RESOLVE_ITEMS = Number(process.env.MKVBASE_MAX_RESOLVE_ITEMS || 2);
+const MKVBASE_MAX_RESOLVE_ITEMS = Number(process.env.MKVBASE_MAX_RESOLVE_ITEMS || 6);
 const MKVBASE_RESOLVE_CONCURRENCY = Number(process.env.MKVBASE_RESOLVE_CONCURRENCY || 2);
-const MKVBASE_HOST_RESOLVE_TIMEOUT_MS = Number(process.env.MKVBASE_HOST_RESOLVE_TIMEOUT_MS || 10000);
+const MKVBASE_HOST_RESOLVE_TIMEOUT_MS = Number(process.env.MKVBASE_HOST_RESOLVE_TIMEOUT_MS || 12000);
+const MKVBASE_HEADERLESS_STREAMS_ONLY = process.env.MKVBASE_HEADERLESS_STREAMS_ONLY === "1";
+const MKVBASE_TARGET_STREAMS = Number(process.env.MKVBASE_TARGET_STREAMS || 4);
 const MKVBASE_DEBUG = process.env.MKVBASE_DEBUG === "true";
 const MKVBASE_BROWSER_WAIT_MS = Number(process.env.MKVBASE_BROWSER_WAIT_MS || 60000);
 const MKVBASE_CF_REFRESH_DELAY_MS = Number(process.env.MKVBASE_CF_REFRESH_DELAY_MS || 8000);
@@ -881,7 +883,9 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
   const seenUrls = new Set();
 
   const candidatesToResolve = matchingItems.slice(0, MKVBASE_MAX_RESOLVE_ITEMS);
-  const resolvedGroups = await mapWithConcurrency(candidatesToResolve, MKVBASE_RESOLVE_CONCURRENCY, async (item) => {
+  for (let i = 0; i < candidatesToResolve.length && streams.length < MKVBASE_TARGET_STREAMS; i += MKVBASE_RESOLVE_CONCURRENCY) {
+    const batch = candidatesToResolve.slice(i, i + MKVBASE_RESOLVE_CONCURRENCY);
+    const resolvedGroups = await mapWithConcurrency(batch, MKVBASE_RESOLVE_CONCURRENCY, async (item) => {
     if (!item.url) return [];
 
     const rawTitleText = item.title ? item.title.split("\n")[0] : info.title;
@@ -899,6 +903,7 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
         const rUrl = getCandidateUrl(candidate);
         if (!rUrl) continue;
         const requestHeaders = getCandidateHeaders(candidate);
+        if (MKVBASE_HEADERLESS_STREAMS_ONLY && requestHeaders) continue;
         const behaviorHints = { notWebReady: true };
         if (!await validateResolvedPlaybackUrl(rUrl, requestHeaders || {})) continue;
         if (requestHeaders) behaviorHints.proxyHeaders = { request: requestHeaders };
@@ -921,6 +926,7 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
         const rUrl = getCandidateUrl(candidate);
         if (!rUrl) continue;
         const requestHeaders = getCandidateHeaders(candidate);
+        if (MKVBASE_HEADERLESS_STREAMS_ONLY && requestHeaders) continue;
         const behaviorHints = { notWebReady: true };
         if (!await validateResolvedPlaybackUrl(rUrl, requestHeaders || {})) continue;
         if (requestHeaders) behaviorHints.proxyHeaders = { request: requestHeaders };
@@ -943,6 +949,7 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
     for (const stream of group || []) {
       addUniqueResolvedStream(streams, seenUrls, stream);
     }
+  }
   }
 
   streams.sort((a, b) => {
