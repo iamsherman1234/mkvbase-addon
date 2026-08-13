@@ -12,6 +12,7 @@ const STREAM_EMPTY_CACHE_TTL_MS = Number(process.env.STREAM_EMPTY_CACHE_TTL_MS |
 const STREAM_CACHE_MAX_ENTRIES = Number(process.env.STREAM_CACHE_MAX_ENTRIES || 500);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://mkvbase.sudoaddon.dpdns.org").replace(/\/$/, "");
 const PROXY_TARGET_TTL_MS = Number(process.env.PROXY_TARGET_TTL_MS || STREAM_STALE_CACHE_TTL_MS);
+const STREAM_PROXY_ENABLED = process.env.STREAM_PROXY_ENABLED === "1";
 const streamCache = new Map();
 const pendingStreams = new Map();
 const resolveQueue = [];
@@ -101,7 +102,7 @@ function getProxyTarget(id) {
 
 function toClientStream(stream) {
   const requestHeaders = stream && stream.behaviorHints && stream.behaviorHints.proxyHeaders && stream.behaviorHints.proxyHeaders.request;
-  if (!requestHeaders || !stream.url) {
+  if (!STREAM_PROXY_ENABLED || !requestHeaders || !stream.url) {
     return {
       name: stream.name,
       title: stream.title,
