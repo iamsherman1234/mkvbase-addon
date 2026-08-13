@@ -1,6 +1,25 @@
 const { addonBuilder, serveHTTP } = require("stremio-addon-sdk");
 const mkvbase = require("./providers/mkvbase");
 
+const STREAM_CACHE_TTL_MS = Number(process.env.STREAM_CACHE_TTL_MS || 20 * 60 * 1000);
+const streamCache = new Map();
+const pendingStreams = new Map();
+
+function getCachedStreams(key) {
+  const entry = streamCache.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    streamCache.delete(key);
+    return null;
+  }
+  return entry.streams;
+}
+
+function setCachedStreams(key, streams) {
+  streamCache.set(key, { streams, expiresAt: Date.now() + STREAM_CACHE_TTL_MS });
+  return streams;
+}
+
 const manifest = {
   id: "community.mkvbase",
   version: "1.0.0",
@@ -26,17 +45,26 @@ builder.defineStreamHandler(async (args) => {
     episode = parseInt(parts[2], 10);
   }
 
+  const cacheKey = [type, id].join(":");
+  const cachedStreams = getCachedStreams(cacheKey);
+  if (cachedStreams) return { streams: cachedStreams };
+
   try {
-    const streams = await mkvbase.getStreams(imdbId, type, season, episode);
-    
-    return { 
-      streams: streams.map(s => ({
+    if (pendingStreams.has(cacheKey)) {
+      return { streams: await pendingStreams.get(cacheKey) };
+    }
+
+    const pending = mkvbase.getStreams(imdbId, type, season, episode)
+      .then(streams => setCachedStreams(cacheKey, streams.map(s => ({
         name: s.name,
         title: s.title,
         url: s.url,
         behaviorHints: s.behaviorHints
-      }))
-    };
+      }))))
+      .finally(() => pendingStreams.delete(cacheKey));
+
+    pendingStreams.set(cacheKey, pending);
+    return { streams: await pending };
   } catch (error) {
     console.error("Error fetching streams from MkvBase:", error);
     return { streams: [] };
