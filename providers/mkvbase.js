@@ -1087,14 +1087,30 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
   return streams;
 }
 
-// ── Session prewarm on module load ──
-setImmediate(async () => {
+// ── Automated Background Session Keep-Alive ──
+async function ensureSessionFreshness() {
   const session = loadDirectSession();
-  if (session) {
-    console.log("[MkvBase] ♻️  Existing session loaded on startup");
+  const sessionAgeMs = session ? Date.now() - Number(session.savedAt || 0) : Infinity;
+  // If session is missing or older than 3.5 hours, refresh it in the background
+  if (!session || sessionAgeMs > 3.5 * 60 * 60 * 1000) {
+    console.log("[MkvBase] 🔄 Session expired or approaching expiry, refreshing in background...");
+    const newSession = await bootstrapMkvBaseSessionWithFlareSolverr();
+    if (newSession) {
+      console.log("[MkvBase] ♻️  Background session refreshed successfully");
+    } else {
+      console.log("[MkvBase] ⚠️  Background session refresh failed, will retry on next check");
+    }
   } else {
-    console.log("[MkvBase] 🔄 No session found, will bootstrap on first request");
+    console.log(`[MkvBase] ♻️  Session is active and fresh (age: ${(sessionAgeMs / 1000 / 60).toFixed(1)} min)`);
   }
+}
+
+// ── Startup check + Background Keep-Alive Timer (every 2 hours) ──
+setImmediate(() => {
+  ensureSessionFreshness();
+  setInterval(() => {
+    ensureSessionFreshness();
+  }, 2 * 60 * 60 * 1000);
 });
 
 module.exports = { lookupIdType: "base", getStreams, resolveGdflix, fetchMkvBaseApi };
