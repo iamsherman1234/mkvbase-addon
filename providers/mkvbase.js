@@ -4,6 +4,45 @@ const crypto = require("crypto");
 const fetch = require("node-fetch");
 const { getCandidateHeaders, getCandidateUrl, isReadyForPlayback, resolveHubcloud, resolvePlayableCandidates, resolveVcloud } = require("../lib/hostResolver");
 
+// ── Performance: In-memory caches ──
+const streamCache = new Map();  // key: "movie:tt1234567" → { streams, ts }
+const STREAM_CACHE_TTL_MS = Number(process.env.MKVBASE_CACHE_TTL_MS || 30 * 60 * 1000); // 30 min
+const resolvedUrlCache = new Map(); // key: hubcloud URL → { candidates, ts }
+const URL_CACHE_TTL_MS = 20 * 60 * 1000; // 20 min
+const tmdbCache = new Map(); // key: imdbId → { info, ts }
+const TMDB_CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+
+function getCachedStreams(cacheKey) {
+  const entry = streamCache.get(cacheKey);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > STREAM_CACHE_TTL_MS) { streamCache.delete(cacheKey); return null; }
+  return entry.streams;
+}
+
+function setCachedStreams(cacheKey, streams) {
+  streamCache.set(cacheKey, { streams, ts: Date.now() });
+  // Evict old entries if cache grows too large
+  if (streamCache.size > 200) {
+    const now = Date.now();
+    for (const [k, v] of streamCache) { if (now - v.ts > STREAM_CACHE_TTL_MS) streamCache.delete(k); }
+  }
+}
+
+function getCachedResolvedUrl(url) {
+  const entry = resolvedUrlCache.get(url);
+  if (!entry) return null;
+  if (Date.now() - entry.ts > URL_CACHE_TTL_MS) { resolvedUrlCache.delete(url); return null; }
+  return entry.candidates;
+}
+
+function setCachedResolvedUrl(url, candidates) {
+  resolvedUrlCache.set(url, { candidates, ts: Date.now() });
+  if (resolvedUrlCache.size > 500) {
+    const now = Date.now();
+    for (const [k, v] of resolvedUrlCache) { if (now - v.ts > URL_CACHE_TTL_MS) resolvedUrlCache.delete(k); }
+  }
+}
+
 function encodeQuery(query, timestamp) {
   if (!query) return "";
   const key = timestamp % 256;
@@ -277,11 +316,11 @@ let mkvbaseBrowserBusy = false;
 const BASE_URL = "https://mkvbase.site";
 const SESSION_PATH = path.join(__dirname, "../.mkvbase_profile/session.json");
 const DIRECT_SESSION_TTL_MS = Number(process.env.MKVBASE_DIRECT_SESSION_TTL_MS || 10 * 60 * 60 * 1000);
-const MKVBASE_MAX_RESOLVE_ITEMS = Number(process.env.MKVBASE_MAX_RESOLVE_ITEMS || 6);
-const MKVBASE_RESOLVE_CONCURRENCY = Number(process.env.MKVBASE_RESOLVE_CONCURRENCY || 2);
-const MKVBASE_HOST_RESOLVE_TIMEOUT_MS = Number(process.env.MKVBASE_HOST_RESOLVE_TIMEOUT_MS || 12000);
+const MKVBASE_MAX_RESOLVE_ITEMS = Number(process.env.MKVBASE_MAX_RESOLVE_ITEMS || 35);
+const MKVBASE_RESOLVE_CONCURRENCY = Number(process.env.MKVBASE_RESOLVE_CONCURRENCY || 8);
+const MKVBASE_HOST_RESOLVE_TIMEOUT_MS = Number(process.env.MKVBASE_HOST_RESOLVE_TIMEOUT_MS || 10000);
 const MKVBASE_HEADERLESS_STREAMS_ONLY = process.env.MKVBASE_HEADERLESS_STREAMS_ONLY === "1";
-const MKVBASE_TARGET_STREAMS = Number(process.env.MKVBASE_TARGET_STREAMS || 4);
+const MKVBASE_TARGET_STREAMS = Number(process.env.MKVBASE_TARGET_STREAMS || 40);
 const MKVBASE_DEBUG = process.env.MKVBASE_DEBUG === "true";
 const MKVBASE_BROWSER_WAIT_MS = Number(process.env.MKVBASE_BROWSER_WAIT_MS || 60000);
 const MKVBASE_CF_REFRESH_DELAY_MS = Number(process.env.MKVBASE_CF_REFRESH_DELAY_MS || 8000);
@@ -294,6 +333,10 @@ const TMDB_BASE = "https://api.themoviedb.org/3";
 const TMDB_KEY = "307b7b8ef035c6aa336900aef4e203bd";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
+
+// ── Performance: Trusted hosts that don't need validation ──
+const TRUSTED_HOST_RE = /pixeldrain\.com\/api\/file\/|workers\.dev|r2\.cloudflarestorage\.com|\.r2\.dev|video-downloads\.googleusercontent\.com|store\d*\.gofile\.io/i;
+function isTrustedHost(url) { return TRUSTED_HOST_RE.test(url || ""); }
 
 function extractMainTitle(str) {
   if (!str) return "";
@@ -331,10 +374,16 @@ function stripSourcePrefix(text) {
 function normalizeReleaseText(text) {
   return stripSourcePrefix(text)
     .toLowerCase()
+    .replace(/&/g, " and ")
     .replace(/\[[^\]]*\]|\([^)]*\)/g, " ")
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function getTitleTokens(title) {
+  const stopWords = new Set(["and", "the", "a", "an", "of", "in", "to", "on", "with", "part", "vol", "volume"]);
+  return normalizeReleaseText(title).split(/\s+/).filter((w) => w.length > 0 && !stopWords.has(w));
 }
 
 function buildSearchTokens(query) {
@@ -358,17 +407,31 @@ function hasTvReleaseMarker(text) {
 }
 
 function movieTitleMatchesResult(itemTitle, targetTitle, targetYear) {
-  const normalizedTitle = normalizeReleaseText(itemTitle);
-  const normalizedTarget = normalizeReleaseText(targetTitle);
-  if (!normalizedTitle || !normalizedTarget) return false;
+  const itemNorm = normalizeReleaseText(itemTitle);
+  const targetNorm = normalizeReleaseText(targetTitle);
+  if (!itemNorm || !targetNorm) return false;
   if (hasTvReleaseMarker(stripSourcePrefix(itemTitle))) return false;
 
-  const titlePattern = new RegExp(`^${normalizedTarget.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\b|$)`);
-  if (!titlePattern.test(normalizedTitle)) return false;
+  const targetTokens = getTitleTokens(targetTitle);
+  const itemTokens = getTitleTokens(itemTitle);
+  if (!targetTokens.length) return true;
+
+  // Key target tokens must be present in the leading portion of item tokens
+  const firstItemTokens = itemTokens.slice(0, targetTokens.length + 3);
+  const allMatch = targetTokens.every((t) => firstItemTokens.includes(t));
+  if (!allMatch) {
+    // Fallback: check startsWith regex
+    const titlePattern = new RegExp(`^${targetNorm.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:\\b|$)`);
+    if (!titlePattern.test(itemNorm)) return false;
+  }
 
   if (targetYear) {
-    const years = extractReleaseYears(itemTitle);
-    if (years.size > 0 && !years.has(String(targetYear))) return false;
+    const years = Array.from(extractReleaseYears(itemTitle));
+    if (years.length > 0) {
+      const targetY = parseInt(targetYear, 10);
+      const matchesYear = years.some((y) => Math.abs(parseInt(y, 10) - targetY) <= 1);
+      if (!matchesYear) return false;
+    }
   }
 
   return true;
@@ -440,13 +503,15 @@ function formatFileSize(bytes) {
 }
 
 async function validateResolvedPlaybackUrl(url, headers = {}) {
+  // Skip validation for trusted hosts — they are always playable
+  if (isTrustedHost(url)) return true;
   try {
     const res = await fetchSafe(url, {
       headers: {
         ...(headers || {}),
         Range: "bytes=0-511"
       }
-    }, 7000);
+    }, 4000);
     if (!res || (!res.ok && res.status !== 206)) return false;
     const contentType = res.headers && res.headers.get ? String(res.headers.get("content-type") || "") : "";
     const contentLength = res.headers && res.headers.get ? Number(res.headers.get("content-length") || 0) : 0;
@@ -463,7 +528,7 @@ async function probeResolvedFileSize(url, headers = {}) {
         ...(headers || {}),
         Range: "bytes=0-0"
       }
-    }, 7000);
+    }, 4000);
     if (!res) return "";
     const contentRange = res.headers && res.headers.get ? String(res.headers.get("content-range") || "") : "";
     const totalBytes = contentRange.includes("/") ? contentRange.split("/").pop().trim() : "";
@@ -487,9 +552,9 @@ function deliveryHostLabel(url) {
   const value = String(url || "").toLowerCase();
   if (value.includes("video-downloads.googleusercontent.com")) return "GD";
   if (value.includes("r2.cloudflarestorage.com") || value.includes(".r2.dev")) return "R2";
-  if (value.includes("workers.dev")) return "Worker";
-  if (value.includes("pixeldrain.com")) return "Pixeldrain";
-  if (value.includes("gofile.io") || /store\d*\.gofile\.io/i.test(value)) return "Gofile";
+  if (value.includes("workers.dev")) return "CF";
+  if (value.includes("pixeldrain.com")) return "PX";
+  if (value.includes("gofile.io") || /store\d*\.gofile\.io/i.test(value)) return "GF";
   if (value.includes("hubcloud")) return "Hubcloud";
   return "Direct";
 }
@@ -505,11 +570,17 @@ function sourceHostLabel(url) {
 }
 
 function streamRouteLabel(sourceUrl, resolvedUrl) {
-  return deliveryHostLabel(resolvedUrl) + "-" + sourceHostLabel(sourceUrl);
+  const delivery = deliveryHostLabel(resolvedUrl);
+  const source = sourceHostLabel(sourceUrl);
+  if (delivery === source) return delivery;
+  return `${delivery}-${source}`;
 }
 
-function mkvbaseStreamName(sourceUrl, resolvedUrl) {
-  return PROVIDER + " [" + streamRouteLabel(sourceUrl, resolvedUrl) + "]";
+function formatQualityLabel(q) {
+  if (q === "2160p") return "4K";
+  if (q === "1440p") return "2K";
+  if (q === "1080p") return "1080p";
+  return q || "HD";
 }
 
 function dedupeItemsByUrl(items) {
@@ -546,39 +617,50 @@ async function fetchSafe(url, opts = {}, timeout = 5000) {
 
 async function fetchTmdbDetails(tmdbId, mediaType) {
   const lookupId = String(tmdbId || "").replace(/^tmdb:/, "");
-  const typeStr = mediaType === "tv" ? "series" : "movie";
+  const cacheKey = `${mediaType}:${lookupId}`;
+
+  // Check TMDB cache first
+  const cached = tmdbCache.get(cacheKey);
+  if (cached && Date.now() - cached.ts < TMDB_CACHE_TTL_MS) return cached.info;
+
+  const isTv = mediaType === "tv" || mediaType === "series";
+  const typeStr = isTv ? "series" : "movie";
   const isImdb = lookupId.startsWith("tt");
 
   if (isImdb) {
     try {
-      const cineRes = await fetchSafe(`https://v3-cinemeta.strem.io/meta/${typeStr}/${lookupId}.json`, {}, 4000);
+      const cineRes = await fetchSafe(`https://v3-cinemeta.strem.io/meta/${typeStr}/${lookupId}.json`, {}, 3000);
       if (cineRes && cineRes.ok) {
         const cineData = await cineRes.json();
         if (cineData && cineData.meta && cineData.meta.name) {
-          return {
+          const info = {
             title: cineData.meta.name,
             year: String(cineData.meta.year || "").substring(0, 4),
             imdbId: cineData.meta.imdb_id || lookupId
           };
+          tmdbCache.set(cacheKey, { info, ts: Date.now() });
+          return info;
         }
       }
     } catch (e) {}
   }
 
-  const endpoint = mediaType === "tv" ? "tv" : "movie";
+  const endpoint = isTv ? "tv" : "movie";
   try {
     const res = await fetchSafe(
       `${TMDB_BASE}/${endpoint}/${lookupId}?api_key=${TMDB_KEY}&append_to_response=external_ids`,
       { headers: { "User-Agent": UA } },
-      5000
+      4000
     );
     if (res && res.ok) {
       const data = await res.json();
-      return {
-        title: mediaType === "tv" ? data.name : data.title,
-        year: (mediaType === "tv" ? data.first_air_date : data.release_date || "").substring(0, 4),
+      const info = {
+        title: isTv ? data.name : data.title,
+        year: (isTv ? data.first_air_date : data.release_date || "").substring(0, 4),
         imdbId: (data.external_ids && data.external_ids.imdb_id) || (isImdb ? lookupId : null)
       };
+      tmdbCache.set(cacheKey, { info, ts: Date.now() });
+      return info;
     }
   } catch (e) {}
 
@@ -813,17 +895,32 @@ async function fetchMkvBaseApi(query, options = {}) {
 }
 
 async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
+  const totalStart = Date.now();
   if (options.fullAddon && !MKVBASE_FULL_ADDON_ENABLED) {
     return [];
   }
-  let info = await fetchTmdbDetails(tmdbId, mediaType);
-  if (!info || !info.title) {
-    await sleep(1000);
-    info = await fetchTmdbDetails(tmdbId, mediaType);
+
+  // ── Check stream cache ──
+  const cacheKey = `${mediaType}:${tmdbId}:${season || 0}:${episode || 0}`;
+  const cachedStreams = getCachedStreams(cacheKey);
+  if (cachedStreams) {
+    console.log(`[MkvBase] ⚡ Cache hit for ${cacheKey} (${cachedStreams.length} streams, ${Date.now() - totalStart}ms)`);
+    return cachedStreams;
   }
+
+  // ── Parallel: TMDB lookup + session prewarm ──
+  const t0 = Date.now();
+  const [info, _session] = await Promise.all([
+    fetchTmdbDetails(tmdbId, mediaType),
+    (async () => { const s = loadDirectSession(); if (!s) return bootstrapMkvBaseSessionWithFlareSolverr(); return s; })()
+  ]);
+  console.log(`[MkvBase] ⏱ TMDB+session: ${Date.now() - t0}ms`);
   if (!info || !info.title) return [];
 
-  const cleanTitle = (info.title || "").toLowerCase()
+  const isTv = mediaType === "tv" || mediaType === "series";
+  const movieYear = !isTv && info.year ? String(info.year) : "";
+
+  const rawT = (info.title || "").toLowerCase()
     .replace(/\bpart\s+two\b/gi, "part 2")
     .replace(/\bpart\s+one\b/gi, "part 1")
     .replace(/\bpart\s+three\b/gi, "part 3")
@@ -832,10 +929,20 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
     .replace(/\s+/g, " ")
     .trim();
 
-  const movieYear = mediaType !== "tv" && info.year ? String(info.year) : "";
-  const searchQueries = mediaType !== "tv" && movieYear
-    ? [cleanTitle + " " + movieYear]
-    : [cleanTitle];
+  const andT = (info.title || "").toLowerCase()
+    .replace(/&/g, " and ")
+    .replace(/[:\-(]/g, " ")
+    .replace(/['"]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  const searchQueries = [];
+  if (!isTv && movieYear) {
+    searchQueries.push(`${andT} ${movieYear}`);
+    if (rawT !== andT) searchQueries.push(`${rawT} ${movieYear}`);
+  }
+  searchQueries.push(andT);
+  if (rawT !== andT) searchQueries.push(rawT);
 
   let items = [];
   let matchingItems = [];
@@ -852,7 +959,7 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
 
     if (!items.length) continue;
 
-    if (mediaType === "tv" && season && episode) {
+    if (isTv && season && episode) {
       const sStr = String(season).padStart(2, "0");
       const eStr = String(episode).padStart(2, "0");
       const seToken = `s${sStr}e${eStr}`;
@@ -862,12 +969,10 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
         return itemTitleLower.includes(seToken) || itemTitleLower.includes(altToken) || itemTitleLower.includes(`season ${season}`);
       });
       if (!matchingItems.length) matchingItems = items;
-    } else if (mediaType !== "tv") {
+    } else if (!isTv) {
       const strictMatches = items.filter((item) => movieTitleMatchesResult(item.title, info.title, movieYear));
       const yearMatches = movieYear ? strictMatches.filter((item) => extractReleaseYears(item.title).has(movieYear)) : [];
       matchingItems = yearMatches.length ? yearMatches : strictMatches;
-      const qualityFilteredItems = matchingItems.filter((item) => isAtLeast1080pTitle(item.title));
-      matchingItems = qualityFilteredItems;
       console.log(`[MkvBase] movie filter kept ${matchingItems.length}/${items.length} items for '${info.title}' ${movieYear || ""}`.trim());
     } else {
       matchingItems = items;
@@ -877,91 +982,119 @@ async function getStreams(tmdbId, mediaType, season, episode, options = {}) {
   }
 
   if (!matchingItems.length) return [];
+  // Keep only 1080p and above (1080p, 1440p/2k, 2160p/4k/UHD)
+  const highQualityItems = matchingItems.filter((item) => isAtLeast1080pTitle(item.title));
+  if (highQualityItems.length) {
+    matchingItems = highQualityItems;
+  }
   matchingItems = dedupeItemsByUrl(matchingItems);
 
   const streams = [];
   const seenUrls = new Set();
+  let earlyDone = false;
 
   const candidatesToResolve = matchingItems.slice(0, MKVBASE_MAX_RESOLVE_ITEMS);
-  for (let i = 0; i < candidatesToResolve.length && streams.length < MKVBASE_TARGET_STREAMS; i += MKVBASE_RESOLVE_CONCURRENCY) {
-    const batch = candidatesToResolve.slice(i, i + MKVBASE_RESOLVE_CONCURRENCY);
-    const resolvedGroups = await mapWithConcurrency(batch, MKVBASE_RESOLVE_CONCURRENCY, async (item) => {
-    if (!item.url) return [];
+  const t2 = Date.now();
+
+  // ── Resolve candidate → stream with early-exit when enough streams collected ──
+  async function resolveOneItem(item, idx) {
+    if (!item.url || earlyDone) return [];
+    const itemStart = Date.now();
 
     const rawTitleText = item.title ? item.title.split("\n")[0] : info.title;
     const quality = normalizeQ(parseQuality(rawTitleText));
+    if (qualityWeight(quality) < qualityWeight("1080p")) return [];
     const size = extractFileSize(rawTitleText);
     const itemStreams = [];
 
-    if (item.url.includes("hubcloud") || item.url.includes("vcloud")) {
-      let resolvedHostLinks = [];
+    // Check URL resolution cache
+    let resolvedHostLinks = getCachedResolvedUrl(item.url);
+    if (!resolvedHostLinks) {
+      if (earlyDone) return [];
       try {
-        resolvedHostLinks = await resolvePlayableCandidates(item.url, { maxDepth: 6, timeout: MKVBASE_HOST_RESOLVE_TIMEOUT_MS });
-      } catch (e) {}
-
-      for (const candidate of resolvedHostLinks || []) {
-        const rUrl = getCandidateUrl(candidate);
-        if (!rUrl) continue;
-        const requestHeaders = getCandidateHeaders(candidate);
-        if (MKVBASE_HEADERLESS_STREAMS_ONLY && requestHeaders) continue;
-        const behaviorHints = { notWebReady: true };
-        if (!await validateResolvedPlaybackUrl(rUrl, requestHeaders || {})) continue;
-        if (requestHeaders) behaviorHints.proxyHeaders = { request: requestHeaders };
-        const resolvedSize = size || await probeResolvedFileSize(rUrl, requestHeaders || {});
-        itemStreams.push({
-          name: "MkvBase",
-          title: `${mkvbaseStreamName(item.url, rUrl)} • ${quality}${resolvedSize ? ' 💾 ' + resolvedSize : ''}`,
-          url: rUrl,
-          quality,
-          size: resolvedSize,
-          behaviorHints
-        });
-      }
-    } else {
-      let directCandidates = [];
-      try {
-        directCandidates = isReadyForPlayback(item.url) ? [item.url] : await resolvePlayableCandidates(item.url, { maxDepth: 6, timeout: MKVBASE_HOST_RESOLVE_TIMEOUT_MS });
-      } catch (e) {}
-      for (const candidate of directCandidates) {
-        const rUrl = getCandidateUrl(candidate);
-        if (!rUrl) continue;
-        const requestHeaders = getCandidateHeaders(candidate);
-        if (MKVBASE_HEADERLESS_STREAMS_ONLY && requestHeaders) continue;
-        const behaviorHints = { notWebReady: true };
-        if (!await validateResolvedPlaybackUrl(rUrl, requestHeaders || {})) continue;
-        if (requestHeaders) behaviorHints.proxyHeaders = { request: requestHeaders };
-        const resolvedSize = size || await probeResolvedFileSize(rUrl, requestHeaders || {});
-        itemStreams.push({
-          name: "MkvBase",
-          title: `${mkvbaseStreamName(item.url, rUrl)} • ${quality}${resolvedSize ? ' 💾 ' + resolvedSize : ''}`,
-          url: rUrl,
-          quality,
-          size: resolvedSize,
-          behaviorHints
-        });
-      }
+        if (item.url.includes("hubcloud") || item.url.includes("vcloud")) {
+          resolvedHostLinks = await resolvePlayableCandidates(item.url, { maxDepth: 4, timeout: MKVBASE_HOST_RESOLVE_TIMEOUT_MS });
+        } else if (isReadyForPlayback(item.url)) {
+          resolvedHostLinks = [item.url];
+        } else {
+          resolvedHostLinks = await resolvePlayableCandidates(item.url, { maxDepth: 4, timeout: MKVBASE_HOST_RESOLVE_TIMEOUT_MS });
+        }
+      } catch (e) { resolvedHostLinks = []; }
+      if (resolvedHostLinks.length) setCachedResolvedUrl(item.url, resolvedHostLinks);
     }
 
-    return itemStreams;
-  });
+    for (const candidate of resolvedHostLinks || []) {
+      if (earlyDone) break;
+      const rUrl = getCandidateUrl(candidate);
+      if (!rUrl) continue;
+      const requestHeaders = getCandidateHeaders(candidate);
+      if (MKVBASE_HEADERLESS_STREAMS_ONLY && requestHeaders) continue;
+      const behaviorHints = { notWebReady: true };
+      if (!await validateResolvedPlaybackUrl(rUrl, requestHeaders || {})) continue;
+      if (requestHeaders) behaviorHints.proxyHeaders = { request: requestHeaders };
+      // Skip slow size probe for trusted hosts when title has no size — just emit stream faster
+      const resolvedSize = size ? size : (isTrustedHost(rUrl) ? "" : await probeResolvedFileSize(rUrl, requestHeaders || {}));
+      const qLabel = formatQualityLabel(quality);
+      const routeLabel = streamRouteLabel(item.url, rUrl);
+      const streamTitle = `${routeLabel} ${qLabel}${resolvedSize ? ' 💾 ' + resolvedSize : ''}`;
+      itemStreams.push({
+        name: "MkvBase",
+        title: streamTitle,
+        url: rUrl,
+        quality,
+        size: resolvedSize,
+        behaviorHints
+      });
+    }
 
-  for (const group of resolvedGroups) {
-    for (const stream of group || []) {
+    debugLog(`item[${idx}] resolved ${itemStreams.length} streams in ${Date.now() - itemStart}ms: ${item.url.slice(0, 60)}`);
+    return itemStreams;
+  }
+
+  // Race-based parallel resolution: collect streams as they arrive, stop early
+  const resolvePromises = candidatesToResolve.map((item, idx) => resolveOneItem(item, idx));
+  const settled = await Promise.allSettled(resolvePromises);
+
+  for (const result of settled) {
+    if (result.status !== "fulfilled") continue;
+    for (const stream of result.value || []) {
       addUniqueResolvedStream(streams, seenUrls, stream);
     }
+    if (streams.length >= MKVBASE_TARGET_STREAMS) { earlyDone = true; }
   }
-  }
+  console.log(`[MkvBase] ⏱ Resolve phase: ${Date.now() - t2}ms (${streams.length} streams from ${candidatesToResolve.length} candidates)`);
 
+  // Quality sorting: 4K (2160p) > 2K (1440p) > 1080p (FHD), then by fastest direct host
   streams.sort((a, b) => {
-    const isPlayableA = a.url.includes("workers.dev") || a.url.includes("pixeldrain") || a.url.includes("hubcloud") || a.url.includes("gofile") ? 2 : 0;
-    const isPlayableB = b.url.includes("workers.dev") || b.url.includes("pixeldrain") || b.url.includes("hubcloud") || b.url.includes("gofile") ? 2 : 0;
-    if (isPlayableB !== isPlayableA) return isPlayableB - isPlayableA;
+    const weights = { "2160p": 5, "1440p": 4, "1080p": 3, "720p": 2, "480p": 1, "HD": 1 };
+    const wDiff = (weights[b.quality] || 0) - (weights[a.quality] || 0);
+    if (wDiff !== 0) return wDiff;
 
-    const weights = { "2160p": 4, "1440p": 3, "1080p": 2, "720p": 1, "480p": 0, "HD": 0 };
-    return (weights[b.quality] || 0) - (weights[a.quality] || 0);
+    const hostPriority = (url) => {
+      const u = (url || "").toLowerCase();
+      if (u.includes("workers.dev") || u.includes("r2.dev") || u.includes("cloudflarestorage")) return 4;
+      if (u.includes("pixeldrain.com")) return 3;
+      if (u.includes("googleusercontent.com")) return 2;
+      if (u.includes("gofile.io")) return 1;
+      return 0;
+    };
+    return hostPriority(b.url) - hostPriority(a.url);
   });
 
+  // Cache the results
+  setCachedStreams(cacheKey, streams);
+  console.log(`[MkvBase] ✅ Total: ${Date.now() - totalStart}ms → ${streams.length} streams for ${cacheKey}`);
   return streams;
 }
+
+// ── Session prewarm on module load ──
+setImmediate(async () => {
+  const session = loadDirectSession();
+  if (session) {
+    console.log("[MkvBase] ♻️  Existing session loaded on startup");
+  } else {
+    console.log("[MkvBase] 🔄 No session found, will bootstrap on first request");
+  }
+});
 
 module.exports = { lookupIdType: "base", getStreams, resolveGdflix, fetchMkvBaseApi };
