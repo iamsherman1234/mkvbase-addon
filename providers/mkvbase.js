@@ -519,10 +519,31 @@ function addUniqueResolvedStream(streams, seenUrls, stream) {
 }
 
 function extractFileSize(text) {
-  const match = String(text || "").match(/(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)\b/i);
+  const match = String(text || "").match(/(?:^|\s|\[|\(|\b)(\d+(?:\.\d+)?)\s*(GB|GiB|MB|MiB)\b/i);
   if (!match) return "";
   const unit = match[2].toUpperCase().replace("IB", "B");
   return match[1] + " " + unit;
+}
+
+function extractFileSizeFromUrl(url) {
+  if (!url) return "";
+  try {
+    const parsed = new URL(url);
+    // 1. Check query parameters like ?bytes=... or ?size=...
+    const bytesParam = parsed.searchParams.get("bytes") || parsed.searchParams.get("size") || parsed.searchParams.get("length");
+    if (bytesParam && /^\d+$/.test(bytesParam) && Number(bytesParam) > 1024 * 1024) {
+      return formatFileSize(bytesParam);
+    }
+    // 2. Check path segment before filename like /<hash>/1398002376/filename.mkv
+    const pathParts = parsed.pathname.split("/").filter(Boolean);
+    if (pathParts.length >= 2) {
+      const secondToLast = pathParts[pathParts.length - 2];
+      if (/^\d{6,13}$/.test(secondToLast)) {
+        return formatFileSize(secondToLast);
+      }
+    }
+  } catch {}
+  return "";
 }
 
 function formatFileSize(bytes) {
@@ -1003,13 +1024,21 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
       const behaviorHints = { notWebReady: true };
       if (!await validateResolvedPlaybackUrl(rUrl, requestHeaders || {})) continue;
       if (requestHeaders) behaviorHints.proxyHeaders = { request: requestHeaders };
-      // Skip slow size probe for trusted hosts when title has no size — just emit stream faster
+
+      const candidateTitle = (typeof candidate === "object" && candidate.title) ? candidate.title : "";
+      const candidateObjSize = (typeof candidate === "object" && candidate.size) ? candidate.size : "";
+      let displaySize = candidateObjSize || extractFileSize(candidateTitle) || extractFileSize(rawTitleText) || extractFileSizeFromUrl(rUrl) || extractFileSizeFromUrl(item.url) || size;
+
+      if (!displaySize) {
+        displaySize = await probeResolvedFileSize(rUrl, requestHeaders || {});
+      }
+
       const rawTitle = (item.title || info.title || "Release").replace(/\n+/g, " ").trim();
       const tags = parseReleaseDetails(rawTitle);
       const qLabel = formatQualityLabel(quality);
       const routeLabel = streamRouteLabel(item.url, rUrl);
-      const displaySize = size || "";
       const sizeTag = displaySize ? `[💾 ${displaySize}] ` : "";
+      const sizeSuffix = displaySize ? ` • 💾 ${displaySize}` : "";
 
       const badgeSuffix = [
         tags.includes("REMUX") ? "REMUX" : "",
@@ -1018,7 +1047,7 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
       ].filter(Boolean).join(" ");
 
       const streamName = `[MkvBase] ${qLabel}${badgeSuffix ? " " + badgeSuffix : ""}`;
-      const streamTitle = `[${routeLabel}] ${sizeTag}${rawTitle}\n${tags.length > 0 ? tags.join(" • ") : qLabel}`;
+      const streamTitle = `[${routeLabel}] ${sizeTag}${rawTitle}\n${tags.length > 0 ? tags.join(" • ") : qLabel}${sizeSuffix}`;
 
       itemStreams.push({
         name: streamName,
