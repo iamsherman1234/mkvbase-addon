@@ -3,7 +3,7 @@ const path = require("path");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
 const { getDomain } = require("../lib/dynamicDomains");
-const { getCandidateHeaders, getCandidateUrl, isReadyForPlayback, resolveHubcloud, resolvePlayableCandidates, resolveVcloud, safeEncodeUrl } = require("../lib/hostResolver");
+const { extractDownloadLinks, fetchGdflixWithSolver, getCandidateHeaders, getCandidateUrl, isReadyForPlayback, resolveHubcloud, resolvePlayableCandidates, resolveVcloud, safeEncodeUrl } = require("../lib/hostResolver");
 
 // ── Performance: In-memory caches ──
 const streamCache = new Map();  // key: "movie:tt1234567" → { streams, ts }
@@ -938,6 +938,33 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
 
   const candidatesToResolve = matchingItems.slice(0, MKVBASE_MAX_RESOLVE_ITEMS);
   const t2 = Date.now();
+
+  // Batch pre-solve GDFlix candidates if multiple are present
+  const uncachedGdflixUrls = candidatesToResolve
+    .map((i) => i.url)
+    .filter((u) => u && /gdflix\.(?:dev|io)\/file\//i.test(u) && !getCachedResolvedUrl(u))
+    .slice(0, 6);
+
+  if (uncachedGdflixUrls.length > 0) {
+    try {
+      const solverResults = await fetchGdflixWithSolver(uncachedGdflixUrls, 35000);
+      for (const [gUrl, resObj] of Object.entries(solverResults)) {
+        if (resObj && resObj.html) {
+          const baseUrl = resObj.baseUrl || gUrl;
+          const extracted = extractDownloadLinks(resObj.html, baseUrl);
+          const readyCandidates = [];
+          for (const link of extracted) {
+            if (/workers\.dev|\.r2\.dev|r2\.cloudflarestorage\.com|pixeldrain\.(?:com|dev)/i.test(link)) {
+              readyCandidates.push({ url: safeEncodeUrl(link), headers: null, title: "Cloudflare R2" });
+            }
+          }
+          if (readyCandidates.length) {
+            setCachedResolvedUrl(gUrl, readyCandidates);
+          }
+        }
+      }
+    } catch (_) {}
+  }
 
   // ── Resolve candidate → stream with early-exit when enough streams collected ──
   async function resolveOneItem(item, idx) {
