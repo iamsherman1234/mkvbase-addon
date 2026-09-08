@@ -3,7 +3,7 @@ const path = require("path");
 const crypto = require("crypto");
 const fetch = require("node-fetch");
 const { getDomain } = require("../lib/dynamicDomains");
-const { getCandidateHeaders, getCandidateUrl, isReadyForPlayback, resolveHubcloud, resolvePlayableCandidates, resolveVcloud } = require("../lib/hostResolver");
+const { getCandidateHeaders, getCandidateUrl, isReadyForPlayback, resolveHubcloud, resolvePlayableCandidates, resolveVcloud, safeEncodeUrl } = require("../lib/hostResolver");
 
 // ── Performance: In-memory caches ──
 const streamCache = new Map();  // key: "movie:tt1234567" → { streams, ts }
@@ -333,8 +333,8 @@ const TMDB_KEY = "307b7b8ef035c6aa336900aef4e203bd";
 
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
-// ── Performance: Trusted hosts that don't need validation ──
-const TRUSTED_HOST_RE = /pixeldrain\.(?:com|dev|net|org|eu\.cc)\/api\/file\/|pixeldra\.in\/api\/file\/|workers\.dev|r2\.cloudflarestorage\.com|\.r2\.dev|video-downloads\.googleusercontent\.com|store\d*\.gofile\.io/i;
+// ── Performance: Direct CDN storage that is inherently reliable ──
+const TRUSTED_HOST_RE = /r2\.cloudflarestorage\.com|\.r2\.dev/i;
 function isTrustedHost(url) { return TRUSTED_HOST_RE.test(url || ""); }
 
 function extractMainTitle(str) {
@@ -524,19 +524,25 @@ function formatFileSize(bytes) {
 }
 
 async function validateResolvedPlaybackUrl(url, headers = {}) {
-  // Skip validation for trusted hosts — they are always playable
+  if (!url) return false;
+  // Direct Cloudflare R2 object storage is fast and reliable
   if (isTrustedHost(url)) return true;
   try {
-    const res = await fetchSafe(url, {
+    const cleanUrl = safeEncodeUrl(url);
+    const res = await fetchSafe(cleanUrl, {
       headers: {
         ...(headers || {}),
         Range: "bytes=0-511"
       }
-    }, 4000);
-    if (!res || (!res.ok && res.status !== 206)) return false;
-    const contentType = res.headers && res.headers.get ? String(res.headers.get("content-type") || "") : "";
-    const contentLength = res.headers && res.headers.get ? Number(res.headers.get("content-length") || 0) : 0;
-    return res.status === 206 || /video|octet-stream|matroska|mp4|mpegurl/i.test(contentType) || contentLength > 1024 * 1024;
+    }, 3500);
+    if (!res) return false;
+    if (res.status === 206) return true;
+    if (res.ok) {
+      const contentType = res.headers && res.headers.get ? String(res.headers.get("content-type") || "") : "";
+      const contentLength = res.headers && res.headers.get ? Number(res.headers.get("content-length") || 0) : 0;
+      return /video|octet-stream|matroska|mp4|mpegurl/i.test(contentType) || contentLength > 1024 * 1024;
+    }
+    return false;
   } catch {
     return false;
   }
@@ -544,12 +550,13 @@ async function validateResolvedPlaybackUrl(url, headers = {}) {
 
 async function probeResolvedFileSize(url, headers = {}) {
   try {
-    const res = await fetchSafe(url, {
+    const cleanUrl = safeEncodeUrl(url);
+    const res = await fetchSafe(cleanUrl, {
       headers: {
         ...(headers || {}),
         Range: "bytes=0-0"
       }
-    }, 4000);
+    }, 3500);
     if (!res) return "";
     const contentRange = res.headers && res.headers.get ? String(res.headers.get("content-range") || "") : "";
     const totalBytes = contentRange.includes("/") ? contentRange.split("/").pop().trim() : "";
@@ -963,24 +970,25 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
       if (earlyDone) break;
       const rUrl = getCandidateUrl(candidate);
       if (!rUrl) continue;
+      const safeUrl = safeEncodeUrl(rUrl);
       const requestHeaders = getCandidateHeaders(candidate);
       if (MKVBASE_HEADERLESS_STREAMS_ONLY && requestHeaders) continue;
       const behaviorHints = { notWebReady: true };
-      if (!await validateResolvedPlaybackUrl(rUrl, requestHeaders || {})) continue;
+      if (!await validateResolvedPlaybackUrl(safeUrl, requestHeaders || {})) continue;
       if (requestHeaders) behaviorHints.proxyHeaders = { request: requestHeaders };
 
       const candidateTitle = (typeof candidate === "object" && candidate.title) ? candidate.title : "";
       const candidateObjSize = (typeof candidate === "object" && candidate.size) ? candidate.size : "";
-      let displaySize = candidateObjSize || extractFileSize(candidateTitle) || extractFileSize(rawTitleText) || extractFileSizeFromUrl(rUrl) || extractFileSizeFromUrl(item.url) || size;
+      let displaySize = candidateObjSize || extractFileSize(candidateTitle) || extractFileSize(rawTitleText) || extractFileSizeFromUrl(safeUrl) || extractFileSizeFromUrl(item.url) || size;
 
       if (!displaySize) {
-        displaySize = await probeResolvedFileSize(rUrl, requestHeaders || {});
+        displaySize = await probeResolvedFileSize(safeUrl, requestHeaders || {});
       }
 
       const rawTitle = (item.title || info.title || "Release").replace(/\n+/g, " ").trim();
       const tags = parseReleaseDetails(rawTitle);
       const qLabel = formatQualityLabel(quality);
-      const routeLabel = streamRouteLabel(item.url, rUrl);
+      const routeLabel = streamRouteLabel(item.url, safeUrl);
       const sizeTag = displaySize ? `[💾 ${displaySize}] ` : "";
       const sizeSuffix = displaySize ? ` • 💾 ${displaySize}` : "";
 
@@ -996,7 +1004,7 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
       itemStreams.push({
         name: streamName,
         title: streamTitle,
-        url: rUrl,
+        url: safeUrl,
         quality,
         size: displaySize,
         behaviorHints
