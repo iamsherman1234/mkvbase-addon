@@ -128,11 +128,18 @@ async function run() {
     console.log(`[MkvBase Solver] 💾 Saved active session to ${SAVE_PATH}`);
 
   } finally {
-    if (browserInstance) {
-      try {
-        await browserInstance.close();
-      } catch (_) {}
-    }
+    try {
+      if (browserInstance) {
+        await browserInstance.close().catch(() => {});
+      }
+    } catch (_) {}
+    try {
+      const { execSync } = require("child_process");
+      execSync("pkill -9 -f /usr/lib/chromium 2>/dev/null || true");
+      execSync("pkill -9 -f '/tmp/lighthouse' 2>/dev/null || true");
+      execSync("pkill -9 -f chrome_crashpad_handler 2>/dev/null || true");
+      execSync("rm -rf /tmp/lighthouse.* 2>/dev/null || true");
+    } catch (_) {}
   }
 }
 

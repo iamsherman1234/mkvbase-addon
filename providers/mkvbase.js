@@ -943,25 +943,32 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
   const uncachedGdflixUrls = candidatesToResolve
     .map((i) => i.url)
     .filter((u) => u && /gdflix\.(?:dev|io)\/file\//i.test(u) && !getCachedResolvedUrl(u))
-    .slice(0, 6);
+    .slice(0, MKVBASE_MAX_RESOLVE_ITEMS);
 
   if (uncachedGdflixUrls.length > 0) {
     try {
       const solverResults = await fetchGdflixWithSolver(uncachedGdflixUrls, 35000);
-      for (const [gUrl, resObj] of Object.entries(solverResults)) {
-        if (resObj && resObj.html) {
+      for (const gUrl of uncachedGdflixUrls) {
+        const resObj = solverResults[gUrl];
+        const readyCandidates = [];
+        if (resObj && (resObj.hrefs || resObj.html)) {
           const baseUrl = resObj.baseUrl || gUrl;
-          const extracted = extractDownloadLinks(resObj.html, baseUrl);
-          const readyCandidates = [];
-          for (const link of extracted) {
-            if (/workers\.dev|\.r2\.dev|r2\.cloudflarestorage\.com|pixeldrain\.(?:com|dev)/i.test(link)) {
-              readyCandidates.push({ url: safeEncodeUrl(link), headers: null, title: "Cloudflare R2" });
+          const linksToCheck = [];
+          if (Array.isArray(resObj.hrefs)) {
+            for (const h of resObj.hrefs) {
+              try { linksToCheck.push(new URL(h, baseUrl).href); } catch (_) { linksToCheck.push(h); }
             }
           }
-          if (readyCandidates.length) {
-            setCachedResolvedUrl(gUrl, readyCandidates);
+          if (resObj.html) {
+            linksToCheck.push(...extractDownloadLinks(resObj.html, baseUrl));
+          }
+          for (const link of linksToCheck) {
+            if (/workers\.dev|\.r2\.dev|r2\.cloudflarestorage\.com|pixeldrain\.(?:com|dev)/i.test(link)) {
+              readyCandidates.push({ url: safeEncodeUrl(link), headers: null, title: "Cloudflare R2", size: resObj.size || "" });
+            }
           }
         }
+        setCachedResolvedUrl(gUrl, readyCandidates);
       }
     } catch (_) {}
   }
