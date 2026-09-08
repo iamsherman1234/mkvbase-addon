@@ -199,67 +199,37 @@ async function fetchMkvBaseApiDirect(query, session = loadDirectSession()) {
   }
 }
 
-async function bootstrapMkvBaseSessionNative() {
-  const started = Date.now();
-  try {
-    const { execFile } = require("child_process");
-    const scriptPath = path.join(__dirname, "../lib/mkvbase_session.py");
-    await new Promise((resolve, reject) => {
-      execFile("python3", [scriptPath, SESSION_PATH], { timeout: 15000 }, (err) => {
-        if (err) return reject(err);
-        resolve();
-      });
-    });
-    const session = loadDirectSession();
-    if (session) {
-      debugLog("Native python session bootstrap usable", `${Date.now() - started}ms`);
-      return session;
-    }
-  } catch (err) {
-    debugLog("Native python session bootstrap error:", err.message);
-  }
-  return null;
-}
-
-async function bootstrapMkvBaseSessionWithFlareSolverr() {
-  if (!MKVBASE_FLARESOLVERR_ENABLED) return null;
-  const started = Date.now();
-  for (let attempt = 1; attempt <= MKVBASE_FLARESOLVERR_ATTEMPTS; attempt++) {
-    try {
-      const res = await fetchSafe(FLARESOLVERR_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          cmd: "request.get",
-          url: getBaseUrl(),
-          maxTimeout: MKVBASE_FLARESOLVERR_TIMEOUT_MS
-        })
-      }, MKVBASE_FLARESOLVERR_TIMEOUT_MS + 5000);
-      if (!res || !res.ok) {
-        debugLog("FlareSolverr HTTP failed", res && res.status, "attempt " + attempt + "/" + MKVBASE_FLARESOLVERR_ATTEMPTS);
-      } else {
-        const data = await res.json();
-        if (data.status !== "ok" || !data.solution) {
-          debugLog("FlareSolverr solve failed", data.status, data.message, "attempt " + attempt + "/" + MKVBASE_FLARESOLVERR_ATTEMPTS);
-        } else {
-          const cookieHeader = cookieHeaderFromCookies(data.solution.cookies || []);
-          const session = saveDirectSession(cookieHeader, data.solution.userAgent);
-          debugLog("FlareSolverr bootstrap", session ? "usable" : "missing cookies", (Date.now() - started) + "ms", "attempt " + attempt + "/" + MKVBASE_FLARESOLVERR_ATTEMPTS);
-          if (session) return session;
-        }
-      }
-    } catch (error) {
-      debugLog("FlareSolverr error", error.message, "attempt " + attempt + "/" + MKVBASE_FLARESOLVERR_ATTEMPTS);
-    }
-    if (attempt < MKVBASE_FLARESOLVERR_ATTEMPTS) await sleep(1500);
-  }
-  return null;
-}
+let solverLock = null;
 
 async function bootstrapMkvBaseSession() {
-  const native = await bootstrapMkvBaseSessionNative();
-  if (native) return native;
-  return await bootstrapMkvBaseSessionWithFlareSolverr();
+  if (solverLock) return solverLock;
+  solverLock = (async () => {
+    const started = Date.now();
+    try {
+      const { execFile } = require("child_process");
+      const scriptPath = path.join(__dirname, "../scripts/solve_mkvbase.js");
+      await new Promise((resolve, reject) => {
+        execFile("node", [scriptPath, SESSION_PATH], { timeout: 45000 }, (err, stdout, stderr) => {
+          if (err) {
+            console.error("[MkvBase] Solver error:", err.message, stderr);
+            return reject(err);
+          }
+          resolve();
+        });
+      });
+      const session = loadDirectSession();
+      if (session) {
+        console.log(`[MkvBase] ✅ On-demand session bootstrap successful (${Date.now() - started}ms)`);
+        return session;
+      }
+    } catch (err) {
+      console.warn("[MkvBase] Session bootstrap error:", err.message);
+    } finally {
+      solverLock = null;
+    }
+    return null;
+  })();
+  return solverLock;
 }
 
 async function fetchMkvBaseApiInPage(page, query, cookieHeader) {
@@ -707,128 +677,92 @@ async function fetchTmdbDetails(tmdbId, mediaType) {
   const typeStr = isTv ? "series" : "movie";
   const isImdb = lookupId.startsWith("tt");
 
+  let info = null;
+
+  // 1. If IMDb ID, query TMDB find endpoint first (most accurate title and metadata)
+  if (isImdb) {
+    try {
+      const tmdbFindRes = await fetchSafe(
+        `${TMDB_BASE}/find/${lookupId}?api_key=${TMDB_KEY}&external_source=imdb_id`,
+        { headers: { "User-Agent": UA } },
+        4000
+      );
+      if (tmdbFindRes && tmdbFindRes.ok) {
+        const data = await tmdbFindRes.json();
+        const results = isTv ? (data.tv_results || []) : (data.movie_results || []);
+        if (results.length > 0) {
+          const item = results[0];
+          info = {
+            title: isTv ? item.name : item.title,
+            year: (isTv ? item.first_air_date : item.release_date || "").substring(0, 4),
+            imdbId: lookupId,
+            alternateTitles: []
+          };
+          if (item.original_title && item.original_title !== info.title) {
+            info.alternateTitles.push(item.original_title);
+          }
+        }
+      }
+    } catch (_) {}
+  }
+
+  // 2. Query Cinemeta as metadata source or alias enricher
   if (isImdb) {
     try {
       const cineRes = await fetchSafe(`https://v3-cinemeta.strem.io/meta/${typeStr}/${lookupId}.json`, {}, 3000);
       if (cineRes && cineRes.ok) {
         const cineData = await cineRes.json();
         if (cineData && cineData.meta && cineData.meta.name) {
-          const info = {
-            title: cineData.meta.name,
-            year: String(cineData.meta.year || "").substring(0, 4),
-            imdbId: cineData.meta.imdb_id || lookupId
-          };
-          tmdbCache.set(cacheKey, { info, ts: Date.now() });
-          return info;
+          if (!info) {
+            info = {
+              title: cineData.meta.name,
+              year: String(cineData.meta.year || "").substring(0, 4),
+              imdbId: cineData.meta.imdb_id || lookupId,
+              alternateTitles: []
+            };
+          } else if (cineData.meta.name !== info.title) {
+            info.alternateTitles.push(cineData.meta.name);
+          }
         }
       }
-    } catch (e) {}
+    } catch (_) {}
   }
 
-  const endpoint = isTv ? "tv" : "movie";
-  try {
-    const res = await fetchSafe(
-      `${TMDB_BASE}/${endpoint}/${lookupId}?api_key=${TMDB_KEY}&append_to_response=external_ids`,
-      { headers: { "User-Agent": UA } },
-      4000
-    );
-    if (res && res.ok) {
-      const data = await res.json();
-      const info = {
-        title: isTv ? data.name : data.title,
-        year: (isTv ? data.first_air_date : data.release_date || "").substring(0, 4),
-        imdbId: (data.external_ids && data.external_ids.imdb_id) || (isImdb ? lookupId : null)
-      };
-      tmdbCache.set(cacheKey, { info, ts: Date.now() });
-      return info;
-    }
-  } catch (e) {}
+  // 3. Fallback for direct TMDB numeric ID
+  if (!info && !isImdb) {
+    const endpoint = isTv ? "tv" : "movie";
+    try {
+      const res = await fetchSafe(
+        `${TMDB_BASE}/${endpoint}/${lookupId}?api_key=${TMDB_KEY}&append_to_response=external_ids`,
+        { headers: { "User-Agent": UA } },
+        4000
+      );
+      if (res && res.ok) {
+        const data = await res.json();
+        info = {
+          title: isTv ? data.name : data.title,
+          year: (isTv ? data.first_air_date : data.release_date || "").substring(0, 4),
+          imdbId: (data.external_ids && data.external_ids.imdb_id) || lookupId,
+          alternateTitles: []
+        };
+        if (data.original_title && data.original_title !== info.title) {
+          info.alternateTitles.push(data.original_title);
+        }
+      }
+    } catch (_) {}
+  }
 
-  return null;
-}
+  if (info) {
+    tmdbCache.set(cacheKey, { info, ts: Date.now() });
+    return info;
+  }
 
-function getChromiumPath() {
-  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) {
-    return process.env.CHROME_PATH;
-  }
-  if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) {
-    return process.env.PUPPETEER_EXECUTABLE_PATH;
-  }
-  const candidates = [
-    "/usr/bin/chromium",
-    "/usr/bin/chromium-browser",
-    "/usr/bin/google-chrome",
-    "/usr/bin/google-chrome-stable",
-    "/usr/local/bin/chromium",
-    "/usr/local/bin/google-chrome"
-  ];
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) return candidate;
-  }
-  try {
-    const puppeteer = require("puppeteer");
-    const exePath = puppeteer.executablePath();
-    if (exePath && fs.existsSync(exePath)) return exePath;
-  } catch (e) {}
   return null;
 }
 
 async function resolveGdflix(gdUrl) {
-  const chromePath = getChromiumPath();
-  if (!chromePath) {
-    console.warn(`[GDFlix Resolver] Chromium binary unavailable on this host for ${gdUrl}`);
-    return null;
-  }
-  try {
-    const { connect } = require("puppeteer-real-browser");
-    const { page, browser } = await connect({
-      headless: false,
-      turnstile: true,
-      customConfig: { chromePath },
-      connectOption: { defaultViewport: { width: 1280, height: 800 } }
-    });
-
-    try {
-      await page.goto(gdUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
-
-      for (let i = 0; i < 15; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        const pTitle = await page.title();
-        if (!pTitle.includes("Just a moment") && !pTitle.includes("Attention Required")) break;
-      }
-      await new Promise((r) => setTimeout(r, 2000));
-
-      const cloudUrl = await page.evaluate(() => {
-        const anchors = Array.from(document.querySelectorAll("a"));
-        const cloudBtn = anchors.find((a) => a.href && a.href.includes("/cloud/"));
-        return cloudBtn ? cloudBtn.href : null;
-      });
-
-      if (!cloudUrl) return null;
-
-      await page.goto(cloudUrl, { waitUntil: "domcontentloaded", timeout: 25000 });
-
-      for (let i = 0; i < 15; i++) {
-        await new Promise((r) => setTimeout(r, 1000));
-        const pTitle = await page.title();
-        if (!pTitle.includes("Just a moment") && !pTitle.includes("Attention Required")) break;
-      }
-      await new Promise((r) => setTimeout(r, 2000));
-
-      const directStreamUrl = await page.evaluate(() => {
-        const anchors = Array.from(document.querySelectorAll("a"));
-        const workerBtn = anchors.find((a) => a.href && (a.href.includes("workers.dev") || a.href.includes(".mkv") || a.href.includes(".mp4")));
-        return workerBtn ? workerBtn.href : null;
-      });
-
-      return directStreamUrl;
-    } finally {
-      await browser.close();
-    }
-  } catch (err) {
-    console.warn(`[GDFlix Resolver] Error for ${gdUrl}:`, err.message);
-    return null;
-  }
+  // Pure HTTP resolver fallback (no browser)
+  return null;
 }
 
 async function fetchMkvBaseApi(query, options = {}) {
@@ -883,7 +817,12 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
 
   const titleVariants = new Set();
   titleVariants.add(effectiveTitle);
-  if (info?.title && info.title !== effectiveTitle) titleVariants.add(info.title);
+  if (info?.title) titleVariants.add(info.title);
+  if (Array.isArray(info?.alternateTitles)) {
+    for (const alt of info.alternateTitles) {
+      if (alt) titleVariants.add(alt);
+    }
+  }
 
   const searchQueries = [];
   for (const t of titleVariants) {
@@ -948,7 +887,12 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
       });
       console.log(`[MkvBase] series filter kept ${queryMatches.length}/${items.length} items for S${sStr}E${eStr}`);
     } else if (!isTv) {
-      const strictMatches = items.filter((item) => movieTitleMatchesResult(item.title, effectiveTitle, movieYear));
+      const strictMatches = items.filter((item) => {
+        for (const t of titleVariants) {
+          if (movieTitleMatchesResult(item.title, t, movieYear)) return true;
+        }
+        return false;
+      });
       const targetY = movieYear ? parseInt(movieYear, 10) : null;
       const yearMatches = targetY
         ? strictMatches.filter((item) => {
