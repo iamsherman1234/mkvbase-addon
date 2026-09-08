@@ -334,7 +334,7 @@ const TMDB_KEY = "307b7b8ef035c6aa336900aef4e203bd";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 // ── Performance: Trusted hosts that don't need validation ──
-const TRUSTED_HOST_RE = /pixeldrain\.com\/api\/file\/|workers\.dev|r2\.cloudflarestorage\.com|\.r2\.dev|video-downloads\.googleusercontent\.com|store\d*\.gofile\.io/i;
+const TRUSTED_HOST_RE = /pixeldrain\.(?:com|dev|net|org|eu\.cc)\/api\/file\/|pixeldra\.in\/api\/file\/|workers\.dev|r2\.cloudflarestorage\.com|\.r2\.dev|video-downloads\.googleusercontent\.com|store\d*\.gofile\.io/i;
 function isTrustedHost(url) { return TRUSTED_HOST_RE.test(url || ""); }
 
 function extractMainTitle(str) {
@@ -574,7 +574,7 @@ function deliveryHostLabel(url) {
   if (value.includes("video-downloads.googleusercontent.com")) return "GD";
   if (value.includes("r2.cloudflarestorage.com") || value.includes(".r2.dev")) return "R2";
   if (value.includes("workers.dev")) return "CF";
-  if (value.includes("pixeldrain.com")) return "PX";
+  if (value.includes("pixeldrain") || value.includes("pixeldra.in")) return "PX";
   if (value.includes("gofile.io") || /store\d*\.gofile\.io/i.test(value)) return "GF";
   if (value.includes("hubcloud")) return "Hubcloud";
   return "Direct";

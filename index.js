@@ -3,6 +3,7 @@ const express = require("express");
 const fetch = require("node-fetch");
 const { addonBuilder, getRouter } = require("stremio-addon-sdk");
 const mkvbase = require("./providers/mkvbase");
+const { fetchPixeldrainWithFailover } = require("./lib/pixeldrainHelper");
 
 const STREAM_CACHE_TTL_MS = Number(process.env.STREAM_CACHE_TTL_MS || 20 * 60 * 1000);
 const STREAM_STALE_CACHE_TTL_MS = Number(process.env.STREAM_STALE_CACHE_TTL_MS || 2 * 60 * 60 * 1000);
@@ -189,7 +190,13 @@ app.get("/proxy/:id", async (req, res) => {
       ...target.headers,
       Range: req.headers.range || target.headers.Range || "bytes=0-"
     };
-    const upstream = await fetch(target.url, { headers: upstreamHeaders });
+    let upstream;
+    if (target.url.includes("pixeldrain") || target.url.includes("pixeldra.in")) {
+      const pdResult = await fetchPixeldrainWithFailover(target.url, { headers: upstreamHeaders });
+      upstream = pdResult.res;
+    } else {
+      upstream = await fetch(target.url, { headers: upstreamHeaders });
+    }
     res.status(upstream.status);
     for (const [name, value] of upstream.headers.entries()) {
       if (["content-length", "content-type", "content-range", "accept-ranges"].includes(name.toLowerCase())) {
