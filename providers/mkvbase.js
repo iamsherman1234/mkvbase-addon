@@ -523,6 +523,30 @@ function formatFileSize(bytes) {
   return (value / (1024 * 1024 * 1024)).toFixed(2) + " GB";
 }
 
+function parseSizeToBytes(input) {
+  if (!input) return 0;
+  if (typeof input === "number" && !isNaN(input)) return input;
+  if (typeof input === "object") {
+    if (input.behaviorHints && typeof input.behaviorHints.videoSize === "number" && input.behaviorHints.videoSize > 0) {
+      return input.behaviorHints.videoSize;
+    }
+    const text = `${input.size || ""} ${input.title || ""} ${input.name || ""}`;
+    return parseSizeToBytes(text);
+  }
+  const match = String(input).match(/(\d+(?:\.\d+)?)\s*(TB|GB|MB|KB|B|TIB|GIB|MIB|KIB)\b/i);
+  if (!match) return 0;
+  const val = parseFloat(match[1]);
+  const unit = match[2].toUpperCase().replace("IB", "B");
+  switch (unit) {
+    case "TB": return val * 1024 * 1024 * 1024 * 1024;
+    case "GB": return val * 1024 * 1024 * 1024;
+    case "MB": return val * 1024 * 1024;
+    case "KB": return val * 1024;
+    case "B": return val;
+    default: return 0;
+  }
+}
+
 async function validateResolvedPlaybackUrl(url, headers = {}) {
   if (!url) return false;
   // Direct Cloudflare R2 object storage is fast and reliable
@@ -931,6 +955,17 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
     matchingItems = highQualityItems;
   }
   matchingItems = dedupeItemsByUrl(matchingItems);
+  matchingItems.sort((a, b) => {
+    const qA = normalizeQ(parseQuality(a.title || ""));
+    const qB = normalizeQ(parseQuality(b.title || ""));
+    const weights = { "2160p": 5, "1440p": 4, "1080p": 3, "720p": 2, "480p": 1, "HD": 1 };
+    const qDiff = (weights[qB] || 0) - (weights[qA] || 0);
+    if (qDiff !== 0) return qDiff;
+
+    const sizeA = parseSizeToBytes(extractFileSize(a.title) || a.title);
+    const sizeB = parseSizeToBytes(extractFileSize(b.title) || b.title);
+    return sizeB - sizeA;
+  });
 
   const streams = [];
   const seenUrls = new Set();
@@ -1035,6 +1070,11 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
       const streamName = `[MkvBase] ${qLabel}${badgeSuffix ? " " + badgeSuffix : ""}`;
       const streamTitle = `[${routeLabel}] ${sizeTag}${rawTitle}\n${tags.length > 0 ? tags.join(" • ") : qLabel}${sizeSuffix}`;
 
+      const sizeBytes = parseSizeToBytes(displaySize);
+      if (sizeBytes > 0) {
+        behaviorHints.videoSize = sizeBytes;
+      }
+
       itemStreams.push({
         name: streamName,
         title: streamTitle,
@@ -1062,16 +1102,24 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
   }
   console.log(`[MkvBase] ⏱ Resolve phase: ${Date.now() - t2}ms (${streams.length} streams from ${candidatesToResolve.length} candidates)`);
 
-  // Quality sorting: 4K (2160p) > 2K (1440p) > 1080p (FHD), then by fastest direct host
+  // Quality sorting: 4K (2160p) > 2K (1440p) > 1080p (FHD), then by file size (largest first), then by fastest direct host
   streams.sort((a, b) => {
     const weights = { "2160p": 5, "1440p": 4, "1080p": 3, "720p": 2, "480p": 1, "HD": 1 };
     const wDiff = (weights[b.quality] || 0) - (weights[a.quality] || 0);
     if (wDiff !== 0) return wDiff;
 
+    // Sort by file size descending (largest file size first)
+    const sizeA = parseSizeToBytes(a.size || a.title || a.name || (a.behaviorHints && a.behaviorHints.videoSize));
+    const sizeB = parseSizeToBytes(b.size || b.title || b.name || (b.behaviorHints && b.behaviorHints.videoSize));
+    if (sizeA !== sizeB) {
+      return sizeB - sizeA;
+    }
+
     const hostPriority = (url) => {
       const u = (url || "").toLowerCase();
+      if (u.includes("fastcdn-dl.pages.dev")) return 5;
       if (u.includes("workers.dev") || u.includes("r2.dev") || u.includes("cloudflarestorage")) return 4;
-      if (u.includes("pixeldrain.com")) return 3;
+      if (u.includes("pixeldrain.com") || u.includes("pixeldrain.dev")) return 3;
       if (u.includes("googleusercontent.com")) return 2;
       if (u.includes("gofile.io")) return 1;
       return 0;
