@@ -3,3 +3,12 @@ node_modules/
 *.log
 .env
 core
+
+# Security & Secrets
+.env.*
+!.env.example
+*.key
+*.pem
+*_session.json
+*.session
+.mkvbase_profile_*
