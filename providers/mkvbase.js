@@ -605,9 +605,11 @@ function deliveryHostLabel(url) {
   if (value.includes("video-downloads.googleusercontent.com")) return "GD";
   if (value.includes("r2.cloudflarestorage.com") || value.includes(".r2.dev")) return "R2";
   if (value.includes("workers.dev")) return "CF";
-  if (value.includes("pixeldrain") || value.includes("pixeldra.in")) return "PX";
-  if (value.includes("gofile.io") || /store\d*\.gofile\.io/i.test(value)) return "GF";
-  if (value.includes("hubcloud")) return "Hubcloud";
+  if (value.includes("pixeldrain") || value.includes("pixeldra.in") || value.includes("eu.cc")) return "PX";
+  if (value.includes("busycdn")) return "Direct";
+  if (value.includes("gofile")) return "GF";
+  if (value.includes("googleusercontent")) return "GD";
+  if (value.includes("streamtape")) return "ST";
   return "Direct";
 }
 
@@ -616,7 +618,7 @@ function sourceHostLabel(url) {
   if (value.includes("gdflix")) return "GDFlix";
   if (value.includes("hubcloud") || value.includes("sportverse") || value.includes("gpdl")) return "Hubcloud";
   if (value.includes("gofile")) return "Gofile";
-  if (value.includes("pixeldrain")) return "Pixeldrain";
+  if (value.includes("pixeldrain") || value.includes("pixeldra.in") || value.includes("eu.cc")) return "Pixeldrain";
   if (value.includes("vcloud")) return "VCloud";
   return "Direct";
 }
@@ -998,7 +1000,7 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
             linksToCheck.push(...extractDownloadLinks(resObj.html, baseUrl));
           }
           for (const link of linksToCheck) {
-            if (/workers\.dev|\.r2\.dev|r2\.cloudflarestorage\.com|pixeldrain\.(?:com|dev)/i.test(link)) {
+            if (/workers\.dev|\.r2\.dev|r2\.cloudflarestorage\.com|pixeldrain\.(?:com|dev|net|org|eu\.cc)|pixeldra\.in/i.test(link)) {
               readyCandidates.push({ url: safeEncodeUrl(link), headers: null, title: "Cloudflare R2", size: resObj.size || "" });
             }
           }
@@ -1119,7 +1121,7 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
       const u = (url || "").toLowerCase();
       if (u.includes("fastcdn-dl.pages.dev")) return 5;
       if (u.includes("workers.dev") || u.includes("r2.dev") || u.includes("cloudflarestorage")) return 4;
-      if (u.includes("pixeldrain.com") || u.includes("pixeldrain.dev")) return 3;
+      if (u.includes("pixeldrain") || u.includes("pixeldra.in") || u.includes("eu.cc")) return 3;
       if (u.includes("googleusercontent.com")) return 2;
       if (u.includes("gofile.io")) return 1;
       return 0;
