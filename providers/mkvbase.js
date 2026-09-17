@@ -209,7 +209,10 @@ async function bootstrapMkvBaseSession() {
       const { execFile } = require("child_process");
       const scriptPath = path.join(__dirname, "../scripts/solve_mkvbase.js");
       await new Promise((resolve, reject) => {
-        execFile("node", [scriptPath, SESSION_PATH], { timeout: 45000 }, (err, stdout, stderr) => {
+        execFile("node", [scriptPath, SESSION_PATH], {
+          timeout: 45000,
+          env: { ...process.env, DISPLAY: process.env.DISPLAY || ":99" }
+        }, (err, stdout, stderr) => {
           if (err) {
             console.error("[MkvBase] Solver error:", err.message, stderr);
             return reject(err);
@@ -315,11 +318,11 @@ let mkvbaseBrowserBusy = false;
 const getBaseUrl = () => getDomain("mkvbase", "https://mkvbase.site");
 const SESSION_PATH = path.join(__dirname, "../.mkvbase_profile/session.json");
 const DIRECT_SESSION_TTL_MS = Number(process.env.MKVBASE_DIRECT_SESSION_TTL_MS || 10 * 60 * 60 * 1000);
-const MKVBASE_MAX_RESOLVE_ITEMS = Number(process.env.MKVBASE_MAX_RESOLVE_ITEMS || 16);
-const MKVBASE_RESOLVE_CONCURRENCY = Number(process.env.MKVBASE_RESOLVE_CONCURRENCY || 12);
-const MKVBASE_HOST_RESOLVE_TIMEOUT_MS = Number(process.env.MKVBASE_HOST_RESOLVE_TIMEOUT_MS || 4000);
+const MKVBASE_MAX_RESOLVE_ITEMS = Number(process.env.MKVBASE_MAX_RESOLVE_ITEMS || 6);
+const MKVBASE_RESOLVE_CONCURRENCY = Number(process.env.MKVBASE_RESOLVE_CONCURRENCY || 6);
+const MKVBASE_HOST_RESOLVE_TIMEOUT_MS = Number(process.env.MKVBASE_HOST_RESOLVE_TIMEOUT_MS || 2500);
 const MKVBASE_HEADERLESS_STREAMS_ONLY = process.env.MKVBASE_HEADERLESS_STREAMS_ONLY === "1";
-const MKVBASE_TARGET_STREAMS = Number(process.env.MKVBASE_TARGET_STREAMS || 16);
+const MKVBASE_TARGET_STREAMS = Number(process.env.MKVBASE_TARGET_STREAMS || 6);
 const MKVBASE_DEBUG = process.env.MKVBASE_DEBUG === "true";
 const MKVBASE_BROWSER_WAIT_MS = Number(process.env.MKVBASE_BROWSER_WAIT_MS || 60000);
 const MKVBASE_CF_REFRESH_DELAY_MS = Number(process.env.MKVBASE_CF_REFRESH_DELAY_MS || 8000);
@@ -334,7 +337,7 @@ const TMDB_KEY = "307b7b8ef035c6aa336900aef4e203bd";
 const UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36";
 
 // ── Performance: Direct CDN storage that is inherently reliable ──
-const TRUSTED_HOST_RE = /r2\.cloudflarestorage\.com|\.r2\.dev/i;
+const TRUSTED_HOST_RE = /r2\.cloudflarestorage\.com|\.r2\.dev|workers\.dev|pages\.dev|pixeldrain|pixeldra\.in|eu\.cc/i;
 function isTrustedHost(url) { return TRUSTED_HOST_RE.test(url || ""); }
 
 function extractMainTitle(str) {
@@ -549,7 +552,7 @@ function parseSizeToBytes(input) {
 
 async function validateResolvedPlaybackUrl(url, headers = {}) {
   if (!url) return false;
-  // Direct Cloudflare R2 object storage is fast and reliable
+  // Direct Cloudflare R2 / Workers / Pixeldrain is fast and reliable
   if (isTrustedHost(url)) return true;
   try {
     const cleanUrl = safeEncodeUrl(url);
@@ -558,7 +561,7 @@ async function validateResolvedPlaybackUrl(url, headers = {}) {
         ...(headers || {}),
         Range: "bytes=0-511"
       }
-    }, 3500);
+    }, 2000);
     if (!res) return false;
     if (res.status === 206) return true;
     if (res.ok) {
@@ -580,7 +583,7 @@ async function probeResolvedFileSize(url, headers = {}) {
         ...(headers || {}),
         Range: "bytes=0-0"
       }
-    }, 3500);
+    }, 2000);
     if (!res) return "";
     const contentRange = res.headers && res.headers.get ? String(res.headers.get("content-range") || "") : "";
     const totalBytes = contentRange.includes("/") ? contentRange.split("/").pop().trim() : "";
@@ -859,36 +862,43 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
 
   const searchQueries = [];
   for (const t of titleVariants) {
-    const rawT = (t || "").toLowerCase()
+    const cleanT = (t || "").toLowerCase()
       .replace(/\bpart\s+two\b/gi, "part 2")
       .replace(/\bpart\s+one\b/gi, "part 1")
       .replace(/\bpart\s+three\b/gi, "part 3")
-      .replace(/[:\-(]/g, " ")
-      .replace(/['"&]/g, "")
+      .replace(/\bvs\.\b/gi, "vs")
+      .replace(/\bv\.\b/gi, "vs")
+      .replace(/[:\-().,!?;~_'"&]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
 
     const andT = (t || "").toLowerCase()
       .replace(/&/g, " and ")
-      .replace(/[:\-(]/g, " ")
-      .replace(/['"]/g, "")
+      .replace(/\bvs\.\b/gi, "vs")
+      .replace(/\bv\.\b/gi, "vs")
+      .replace(/[:\-().,!?;~_'"&]/g, " ")
       .replace(/\s+/g, " ")
       .trim();
 
     if (isTv && season && episode) {
       const sStr = String(season).padStart(2, "0");
       const eStr = String(episode).padStart(2, "0");
-      searchQueries.push(`${andT} s${sStr}e${eStr}`);
-      searchQueries.push(`${andT} season ${season}`);
-      searchQueries.push(andT);
+      searchQueries.push(`${cleanT} s${sStr}e${eStr}`);
+      searchQueries.push(`${cleanT} season ${season}`);
+      searchQueries.push(cleanT);
+      if (andT !== cleanT) {
+        searchQueries.push(`${andT} s${sStr}e${eStr}`);
+      }
     } else if (!isTv && movieYear) {
-      searchQueries.push(andT);
-      searchQueries.push(`${andT} ${movieYear}`);
-      if (rawT !== andT) searchQueries.push(rawT);
-      if (rawT !== andT) searchQueries.push(`${rawT} ${movieYear}`);
+      searchQueries.push(cleanT);
+      searchQueries.push(`${cleanT} ${movieYear}`);
+      if (andT !== cleanT) {
+        searchQueries.push(andT);
+        searchQueries.push(`${andT} ${movieYear}`);
+      }
     } else {
-      searchQueries.push(andT);
-      if (rawT !== andT) searchQueries.push(rawT);
+      searchQueries.push(cleanT);
+      if (andT !== cleanT) searchQueries.push(andT);
     }
   }
 
@@ -984,7 +994,7 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
 
   if (uncachedGdflixUrls.length > 0) {
     try {
-      const solverResults = await fetchGdflixWithSolver(uncachedGdflixUrls, 35000);
+      const solverResults = await fetchGdflixWithSolver(uncachedGdflixUrls, 8000);
       for (const gUrl of uncachedGdflixUrls) {
         const resObj = solverResults[gUrl];
         const readyCandidates = [];
@@ -1034,7 +1044,7 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
           resolvedHostLinks = await resolvePlayableCandidates(item.url, { maxDepth: 4, timeout: MKVBASE_HOST_RESOLVE_TIMEOUT_MS });
         }
       } catch (e) { resolvedHostLinks = []; }
-      if (resolvedHostLinks.length) setCachedResolvedUrl(item.url, resolvedHostLinks);
+      if (resolvedHostLinks && resolvedHostLinks.length) setCachedResolvedUrl(item.url, resolvedHostLinks);
     }
 
     for (const candidate of resolvedHostLinks || []) {
@@ -1052,7 +1062,7 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
       const candidateObjSize = (typeof candidate === "object" && candidate.size) ? candidate.size : "";
       let displaySize = candidateObjSize || extractFileSize(candidateTitle) || extractFileSize(rawTitleText) || extractFileSizeFromUrl(safeUrl) || extractFileSizeFromUrl(item.url) || size;
 
-      if (!displaySize) {
+      if (!displaySize && !isTrustedHost(safeUrl)) {
         displaySize = await probeResolvedFileSize(safeUrl, requestHeaders || {});
       }
 
@@ -1091,17 +1101,31 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
     return itemStreams;
   }
 
-  // Race-based parallel resolution: collect streams as they arrive, stop early
-  const resolvePromises = candidatesToResolve.map((item, idx) => resolveOneItem(item, idx));
-  const settled = await Promise.allSettled(resolvePromises);
-
-  for (const result of settled) {
-    if (result.status !== "fulfilled") continue;
-    for (const stream of result.value || []) {
-      addUniqueResolvedStream(streams, seenUrls, stream);
+  // Parallel resolution with live collection, immediate streaming, and early exit
+  const resolvePromises = candidatesToResolve.map(async (item, idx) => {
+    if (earlyDone) return [];
+    try {
+      const itemStreams = await resolveOneItem(item, idx);
+      for (const stream of itemStreams) {
+        addUniqueResolvedStream(streams, seenUrls, stream);
+      }
+      if (streams.length >= MKVBASE_TARGET_STREAMS) {
+        earlyDone = true;
+      }
+      return itemStreams;
+    } catch (_) {
+      return [];
     }
-    if (streams.length >= MKVBASE_TARGET_STREAMS) { earlyDone = true; }
-  }
+  });
+
+  // Cap resolve phase to 6 seconds max so client requests never timeout
+  const resolveTimeoutPromise = new Promise((resolve) => setTimeout(resolve, 6000));
+  await Promise.race([
+    Promise.allSettled(resolvePromises),
+    resolveTimeoutPromise
+  ]);
+  earlyDone = true;
+
   console.log(`[MkvBase] ⏱ Resolve phase: ${Date.now() - t2}ms (${streams.length} streams from ${candidatesToResolve.length} candidates)`);
 
   // Quality sorting: 4K (2160p) > 2K (1440p) > 1080p (FHD), then by file size (largest first), then by fastest direct host
@@ -1139,8 +1163,8 @@ async function getStreams(tmdbId, mediaType, season = null, episode = null, medi
 async function ensureSessionFreshness() {
   const session = loadDirectSession();
   const sessionAgeMs = session ? Date.now() - Number(session.savedAt || 0) : Infinity;
-  // If session is missing or older than 2.5 hours, refresh it in the background
-  if (!session || sessionAgeMs > 2.5 * 60 * 60 * 1000) {
+  // If session is missing or older than 60 minutes, refresh it in the background
+  if (!session || sessionAgeMs > 60 * 60 * 1000) {
     console.log("[MkvBase] 🔄 Session expired or approaching expiry, refreshing in background...");
     const newSession = await bootstrapMkvBaseSession();
     if (newSession) {
@@ -1153,12 +1177,12 @@ async function ensureSessionFreshness() {
   }
 }
 
-// ── Startup check + Background Keep-Alive Timer (every 2 hours) ──
+// ── Startup check + Background Keep-Alive Timer (every 30 minutes) ──
 setImmediate(() => {
   ensureSessionFreshness();
   const timer = setInterval(() => {
     ensureSessionFreshness();
-  }, 2 * 60 * 60 * 1000);
+  }, 30 * 60 * 1000);
   if (timer && typeof timer.unref === "function") {
     timer.unref();
   }

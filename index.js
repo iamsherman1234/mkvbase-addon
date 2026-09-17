@@ -5,11 +5,11 @@ const { addonBuilder, getRouter } = require("stremio-addon-sdk");
 const mkvbase = require("./providers/mkvbase");
 const { fetchPixeldrainWithFailover } = require("./lib/pixeldrainHelper");
 
-const STREAM_CACHE_TTL_MS = Number(process.env.STREAM_CACHE_TTL_MS || 20 * 60 * 1000);
-const STREAM_STALE_CACHE_TTL_MS = Number(process.env.STREAM_STALE_CACHE_TTL_MS || 2 * 60 * 60 * 1000);
-const STREAM_RESOLVE_CONCURRENCY = Number(process.env.STREAM_RESOLVE_CONCURRENCY || 2);
-const STREAM_QUEUE_TIMEOUT_MS = Number(process.env.STREAM_QUEUE_TIMEOUT_MS || 25000);
-const STREAM_EMPTY_CACHE_TTL_MS = Number(process.env.STREAM_EMPTY_CACHE_TTL_MS || 2 * 60 * 1000);
+const STREAM_CACHE_TTL_MS = Number(process.env.STREAM_CACHE_TTL_MS || 2 * 60 * 60 * 1000);
+const STREAM_STALE_CACHE_TTL_MS = Number(process.env.STREAM_STALE_CACHE_TTL_MS || 12 * 60 * 60 * 1000);
+const STREAM_RESOLVE_CONCURRENCY = Number(process.env.STREAM_RESOLVE_CONCURRENCY || 6);
+const STREAM_QUEUE_TIMEOUT_MS = Number(process.env.STREAM_QUEUE_TIMEOUT_MS || 15000);
+const STREAM_EMPTY_CACHE_TTL_MS = Number(process.env.STREAM_EMPTY_CACHE_TTL_MS || 10 * 60 * 1000);
 const STREAM_CACHE_MAX_ENTRIES = Number(process.env.STREAM_CACHE_MAX_ENTRIES || 500);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "https://mkvbase.sudoaddon.dpdns.org").replace(/\/$/, "");
 const PROXY_TARGET_TTL_MS = Number(process.env.PROXY_TARGET_TTL_MS || STREAM_STALE_CACHE_TTL_MS);

@@ -3,10 +3,43 @@
 const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
+const { execSync } = require("child_process");
 
 const DEFAULT_SAVE_PATH = path.join(__dirname, "../.mkvbase_profile/session.json");
 const SAVE_PATH = process.argv[2] || DEFAULT_SAVE_PATH;
 const TARGET_URL = process.env.MKVBASE_URL || "https://mkvbase.site/";
+
+function getXvfbDisplay() {
+  if (process.env.DISPLAY) return process.env.DISPLAY;
+  try {
+    const sockets = fs.readdirSync("/tmp/.X11-unix");
+    if (sockets.includes("X99")) return ":99";
+  } catch (_) {}
+  try {
+    const out = execSync("ps aux | grep -i '[X]vfb :'", { encoding: "utf8" });
+    if (out.includes(":99")) return ":99";
+    const match = out.match(/Xvfb\s+(:[0-9]+)/i);
+    if (match) return match[1];
+  } catch (_) {}
+  return ":99";
+}
+
+function getChromiumPath() {
+  if (process.env.CHROME_PATH && fs.existsSync(process.env.CHROME_PATH)) return process.env.CHROME_PATH;
+  if (process.env.PUPPETEER_EXECUTABLE_PATH && fs.existsSync(process.env.PUPPETEER_EXECUTABLE_PATH)) return process.env.PUPPETEER_EXECUTABLE_PATH;
+  const candidates = [
+    "/usr/bin/chromium",
+    "/usr/bin/chromium-browser",
+    "/usr/bin/google-chrome",
+    "/usr/bin/google-chrome-stable",
+    "/usr/local/bin/chromium",
+    "/usr/local/bin/google-chrome"
+  ];
+  for (const c of candidates) {
+    if (fs.existsSync(c)) return c;
+  }
+  return null;
+}
 
 function sha256Hex(data) {
   return crypto.createHash("sha256").update(data, "utf8").digest("hex");
@@ -73,23 +106,28 @@ async function testSearch(session, testQuery = "Avatar") {
 }
 
 async function run() {
+  const display = getXvfbDisplay();
+  process.env.DISPLAY = display;
+
+  const chromePath = getChromiumPath();
   const { connect } = require("puppeteer-real-browser");
   const started = Date.now();
-  console.log(`[MkvBase Solver] Launching on-demand browser for ${TARGET_URL}...`);
+  console.log(`[MkvBase Solver] Launching on-demand browser for ${TARGET_URL} on display ${display}...`);
 
   let browserInstance = null;
   try {
     const { page, browser } = await connect({
       headless: false,
       turnstile: true,
+      customConfig: chromePath ? { chromePath } : {},
       connectOption: { defaultViewport: { width: 1280, height: 800 } }
     });
     browserInstance = browser;
 
-    await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 35000 });
+    await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 25000 });
 
     let validSession = null;
-    const deadline = Date.now() + 35000;
+    const deadline = Date.now() + 25000;
 
     while (Date.now() < deadline) {
       await new Promise((r) => setTimeout(r, 1000));
@@ -134,7 +172,6 @@ async function run() {
       }
     } catch (_) {}
     try {
-      const { execSync } = require("child_process");
       execSync("pkill -9 -f /usr/lib/chromium 2>/dev/null || true");
       execSync("pkill -9 -f '/tmp/lighthouse' 2>/dev/null || true");
       execSync("pkill -9 -f chrome_crashpad_handler 2>/dev/null || true");
